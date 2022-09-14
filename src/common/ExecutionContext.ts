@@ -15,9 +15,11 @@
  */
 
 import {Protocol} from 'devtools-protocol';
+import {isErrorLike} from '../util/ErrorLike.js';
 import {CDPSession} from './Connection.js';
 import {IsolatedWorld} from './IsolatedWorld.js';
 import {JSHandle} from './JSHandle.js';
+import {LazyArg} from './LazyArg.js';
 import {EvaluateFunc, HandleFor} from './types.js';
 import {
   createJSHandle,
@@ -228,56 +230,60 @@ export class ExecutionContext {
         ? expression
         : expression + '\n' + suffix;
 
+      try {
+        const {exceptionDetails, result: remoteObject} = await this._client
+          .send('Runtime.evaluate', {
+            expression: expressionWithSourceUrl,
+            contextId,
+            returnByValue,
+            awaitPromise: true,
+            userGesture: true,
+          })
+          .catch(inspectError);
+
+        if (exceptionDetails) {
+          throw new Error(
+            'Evaluation failed: ' + getExceptionMessage(exceptionDetails)
+          );
+        }
+
+        return returnByValue
+          ? valueFromRemoteObject(remoteObject)
+          : createJSHandle(this, remoteObject);
+      } catch (error) {
+        if (isErrorLike(error)) {
+          rewriteError(error);
+        }
+        throw error;
+      }
+    }
+
+    const functionText = pageFunction.toString();
+    checkFunction(functionText);
+
+    try {
       const {exceptionDetails, result: remoteObject} = await this._client
-        .send('Runtime.evaluate', {
-          expression: expressionWithSourceUrl,
-          contextId,
+        .send('Runtime.callFunctionOn', {
+          functionDeclaration: functionText + '\n' + suffix + '\n',
+          executionContextId: this._contextId,
+          arguments: await Promise.all(
+            args.map(arg => {
+              return this.marshallArgument(arg);
+            })
+          ),
           returnByValue,
           awaitPromise: true,
           userGesture: true,
         })
-        .catch(rewriteError);
-
+        .catch(inspectError);
       if (exceptionDetails) {
         throw new Error(
           'Evaluation failed: ' + getExceptionMessage(exceptionDetails)
         );
       }
-
       return returnByValue
         ? valueFromRemoteObject(remoteObject)
         : createJSHandle(this, remoteObject);
-    }
-
-    let functionText = pageFunction.toString();
-    try {
-      new Function('(' + functionText + ')');
-    } catch (error) {
-      // This means we might have a function shorthand. Try another
-      // time prefixing 'function '.
-      if (functionText.startsWith('async ')) {
-        functionText =
-          'async function ' + functionText.substring('async '.length);
-      } else {
-        functionText = 'function ' + functionText;
-      }
-      try {
-        new Function('(' + functionText + ')');
-      } catch (error) {
-        // We tried hard to serialize, but there's a weird beast here.
-        throw new Error('Passed function is not well-serializable!');
-      }
-    }
-    let callFunctionOnPromise;
-    try {
-      callFunctionOnPromise = this._client.send('Runtime.callFunctionOn', {
-        functionDeclaration: functionText + '\n' + suffix + '\n',
-        executionContextId: this._contextId,
-        arguments: args.map(convertArgument.bind(this)),
-        returnByValue,
-        awaitPromise: true,
-        userGesture: true,
-      });
     } catch (error) {
       if (
         error instanceof TypeError &&
@@ -285,80 +291,94 @@ export class ExecutionContext {
       ) {
         error.message += ' Recursive objects are not allowed.';
       }
+      if (isErrorLike(error)) {
+        rewriteError(error);
+      }
       throw error;
     }
-    const {exceptionDetails, result: remoteObject} =
-      await callFunctionOnPromise.catch(rewriteError);
-    if (exceptionDetails) {
-      throw new Error(
-        'Evaluation failed: ' + getExceptionMessage(exceptionDetails)
-      );
-    }
-    return returnByValue
-      ? valueFromRemoteObject(remoteObject)
-      : createJSHandle(this, remoteObject);
+  }
 
-    function convertArgument(
-      this: ExecutionContext,
-      arg: unknown
-    ): Protocol.Runtime.CallArgument {
-      if (typeof arg === 'bigint') {
-        // eslint-disable-line valid-typeof
-        return {unserializableValue: `${arg.toString()}n`};
-      }
-      if (Object.is(arg, -0)) {
-        return {unserializableValue: '-0'};
-      }
-      if (Object.is(arg, Infinity)) {
-        return {unserializableValue: 'Infinity'};
-      }
-      if (Object.is(arg, -Infinity)) {
-        return {unserializableValue: '-Infinity'};
-      }
-      if (Object.is(arg, NaN)) {
-        return {unserializableValue: 'NaN'};
-      }
-      const objectHandle = arg && arg instanceof JSHandle ? arg : null;
-      if (objectHandle) {
-        if (objectHandle.executionContext() !== this) {
-          throw new Error(
-            'JSHandles can be evaluated only in the context they were created!'
-          );
-        }
-        if (objectHandle.disposed) {
-          throw new Error('JSHandle is disposed!');
-        }
-        if (objectHandle.remoteObject().unserializableValue) {
-          return {
-            unserializableValue:
-              objectHandle.remoteObject().unserializableValue,
-          };
-        }
-        if (!objectHandle.remoteObject().objectId) {
-          return {value: objectHandle.remoteObject().value};
-        }
-        return {objectId: objectHandle.remoteObject().objectId};
-      }
-      return {value: arg};
+  async marshallArgument(arg: unknown): Promise<Protocol.Runtime.CallArgument> {
+    if (arg instanceof LazyArg) {
+      arg = await arg.get();
     }
+    if (typeof arg === 'bigint') {
+      // eslint-disable-line valid-typeof
+      return {unserializableValue: `${arg.toString()}n`};
+    }
+    if (Object.is(arg, -0)) {
+      return {unserializableValue: '-0'};
+    }
+    if (Object.is(arg, Infinity)) {
+      return {unserializableValue: 'Infinity'};
+    }
+    if (Object.is(arg, -Infinity)) {
+      return {unserializableValue: '-Infinity'};
+    }
+    if (Object.is(arg, NaN)) {
+      return {unserializableValue: 'NaN'};
+    }
+    const handle = arg && arg instanceof JSHandle ? arg : null;
+    if (handle) {
+      if (handle.executionContext() !== this) {
+        throw new Error(
+          'JSHandles can be evaluated only in the context they were created!'
+        );
+      }
+      if (handle.disposed) {
+        throw new Error('JSHandle is disposed!');
+      }
+      if (handle.remoteObject().unserializableValue) {
+        return {
+          unserializableValue: handle.remoteObject().unserializableValue,
+        };
+      }
+      if (!handle.remoteObject().objectId) {
+        return {value: handle.remoteObject().value};
+      }
+      return {objectId: handle.remoteObject().objectId};
+    }
+    return {value: arg};
   }
 }
 
-const rewriteError = (error: Error): Protocol.Runtime.EvaluateResponse => {
+const inspectError = (error: Error): Protocol.Runtime.EvaluateResponse => {
   if (error.message.includes('Object reference chain is too long')) {
     return {result: {type: 'undefined'}};
   }
   if (error.message.includes("Object couldn't be returned by value")) {
     return {result: {type: 'undefined'}};
   }
+  throw error;
+};
 
+const rewriteError = (error: Error): void => {
   if (
     error.message.endsWith('Cannot find context with specified id') ||
     error.message.endsWith('Inspected target navigated or closed')
   ) {
-    throw new Error(
-      'Execution context was destroyed, most likely because of a navigation.'
-    );
+    error.message =
+      'Execution context was destroyed, most likely because of a navigation.';
   }
-  throw error;
+};
+
+const checkFunction = (functionText: string): void => {
+  try {
+    new Function('(' + functionText + ')');
+  } catch (error) {
+    // This means we might have a function shorthand. Try another
+    // time prefixing 'function '.
+    if (functionText.startsWith('async ')) {
+      functionText =
+        'async function ' + functionText.substring('async '.length);
+    } else {
+      functionText = 'function ' + functionText;
+    }
+    try {
+      new Function('(' + functionText + ')');
+    } catch (error) {
+      // We tried hard to serialize, but there's a weird beast here.
+      throw new Error('Passed function is not well-serializable!');
+    }
+  }
 };
